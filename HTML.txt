@@ -1,0 +1,134 @@
+import pdfplumber
+import pandas as pd
+import re
+import os
+
+# --- 1. PARSING ENGINE (HDFC/ICICI Style Format) ---
+def parse_bank_statement(file_path):
+    """
+    Extracts transactions from PDF. 
+    Assumes standard columns: Date, Narration, Chq/Ref, Value Date, Debit, Credit, Balance
+    """
+    data = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            # Extract table - settings may need tweaking per bank
+            table = page.extract_table()
+            if table:
+                for row in table:
+                    # Basic cleaning to remove header rows or empty lines
+                    cleaned_row = [str(x).replace('\n', ' ') if x else '' for x in row]
+                    
+                    # Rudimentary check: Does the row start with a Date? (DD/MM/YY)
+                    if re.match(r'\d{2}/\d{2}/\d{2}', cleaned_row[0]):
+                        data.append(cleaned_row)
+
+    # Convert to DataFrame (Adjust indices based on specific Bank format)
+    # This example assumes a 7-column format common in Indian banks
+    try:
+        df = pd.DataFrame(data)
+        # We assume: 0=Date, 1=Narration, 4=Debit, 5=Credit (Adjust as needed)
+        df = df.iloc[:, [0, 1, 4, 5]] 
+        df.columns = ['Date', 'Narration', 'Debit', 'Credit']
+        
+        # Clean amounts (remove commas, handle empty strings)
+        df['Debit'] = df['Debit'].apply(lambda x: float(str(x).replace(',', '')) if x and x.strip() != '' else 0.0)
+        df['Credit'] = df['Credit'].apply(lambda x: float(str(x).replace(',', '')) if x and x.strip() != '' else 0.0)
+        
+        return df
+    except Exception as e:
+        return None
+
+# --- 2. AI CLASSIFICATION ENGINE (Rule Based) ---
+def classify_transaction(narration, amount, txn_type):
+    narration = narration.upper()
+    
+    # RULE SET (Expand this list)
+    rules = {
+        "UPI": "Suspense / General Expense",
+        "ATM": "Cash Account",
+        "ZERODHA": "Investment in Shares",
+        "NETFLIX": "Software Subscription",
+        "AMAZON": "Office General Expenses",
+        "SALARY": "Salary Payable",
+        "RENT": "Rent Expenses",
+        "BANK CHG": "Bank Charges",
+        "INTEREST": "Interest Income",
+        "GST": "GST Payable"
+    }
+
+    # 1. Exact/Partial Keyword Match
+    for keyword, ledger in rules.items():
+        if keyword in narration:
+            return ledger
+
+    # 2. Logic based on Type
+    if txn_type == "Receipt":
+        return "Sales / Professional Income"
+    else:
+        return "Unclassified Expense"
+
+# --- 3. TALLY XML GENERATOR ---
+def generate_tally_xml(df, bank_ledger_name="HDFC Bank"):
+    xml_header = """<ENVELOPE>
+    <HEADER>
+    <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+    <IMPORTDATA>
+    <REQUESTDESC>
+    <REPORTNAME>Vouchers</REPORTNAME>
+    </IMPORTDATA>
+    <REQUESTDATA>
+    <TALLYMESSAGE xmlns:UDF="TallyUDF">"""
+
+    xml_footer = """</TALLYMESSAGE>
+    </REQUESTDATA>
+    </IMPORTDATA>
+    </BODY>
+    </ENVELOPE>"""
+
+    vouchers_xml = ""
+
+    for index, row in df.iterrows():
+        # Determine Voucher Type
+        if row['Credit'] > 0:
+            vch_type = "Receipt"
+            amount = row['Credit']
+            dr_ledger = bank_ledger_name
+            cr_ledger = row['Suggested_Ledger']
+        else:
+            vch_type = "Payment"
+            amount = row['Debit']
+            dr_ledger = row['Suggested_Ledger']
+            cr_ledger = bank_ledger_name
+
+        # Format Date for Tally (YYYYMMDD)
+        try:
+            date_parts = row['Date'].split('/')
+            tally_date = f"20{date_parts[2]}{date_parts[1]}{date_parts[0]}" # Assumes DD/MM/YY
+        except:
+            tally_date = "20250101" # Fallback
+
+        # Create XML Block for one Voucher
+        vouchers_xml += f"""
+        <VOUCHER VCHTYPE="{vch_type}" ACTION="Create">
+            <DATE>{tally_date}</DATE>
+            <NARRATION>{row['Narration']}</NARRATION>
+            <VOUCHERTYPENAME>{vch_type}</VOUCHERTYPENAME>
+            
+            <LEDGERENTRIES.LIST>
+                <LEDGERNAME>{dr_ledger}</LEDGERNAME>
+                <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                <AMOUNT>-{amount}</AMOUNT>
+            </LEDGERENTRIES.LIST>
+            
+            <LEDGERENTRIES.LIST>
+                <LEDGERNAME>{cr_ledger}</LEDGERNAME>
+                <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                <AMOUNT>{amount}</AMOUNT>
+            </LEDGERENTRIES.LIST>
+        </VOUCHER>
+        """
+
+    return xml_header + vouchers_xml + xml_footer
